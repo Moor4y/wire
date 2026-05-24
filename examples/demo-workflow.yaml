@@ -1,0 +1,11 @@
+steps:
+  - id: step-a
+    type: emit_message
+    with:
+      message: "Hello from Step A"
+
+  - id: step-b
+    type: consume_message
+    uses: step-a
+    with:
+      incoming: "${state.message}"

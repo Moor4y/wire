@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 
 	"headless-orchestrator/internal/domain"
@@ -13,6 +14,8 @@ import (
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
 )
+
+var statePlaceholderPattern = regexp.MustCompile(`\$\{state\.([a-zA-Z0-9_.-]+)\}`)
 
 // ErrMCPExecutionFailed wraps external MCP failures so callers can halt one
 // workflow run without destabilizing the daemon process.
@@ -78,8 +81,6 @@ func (e *MCPExecutor) Execute(
 	step domain.Step,
 	state map[string]interface{},
 ) (map[string]interface{}, error) {
-	_ = state // state is available for future parameter templating logic.
-
 	c, err := client.NewStdioMCPClient(e.command, e.env, e.args...)
 	if err != nil {
 		return nil, e.wrapFailure(step.ID, "create stdio client", err)
@@ -110,7 +111,11 @@ func (e *MCPExecutor) Execute(
 		if key == "tool" {
 			continue
 		}
-		arguments[key] = value
+		resolved, err := resolveValueWithState(value, state)
+		if err != nil {
+			return nil, e.wrapFailure(step.ID, "resolve step arguments", fmt.Errorf("with.%s: %w", key, err))
+		}
+		arguments[key] = resolved
 	}
 
 	req := mcp.CallToolRequest{}
@@ -142,6 +147,79 @@ func (e *MCPExecutor) wrapFailure(stepID string, stage string, err error) error 
 	}
 	e.logger.Error("mcp step execution failed", "step_id", stepID, "stage", stage, "error", err)
 	return wrapped
+}
+
+func resolveValueWithState(value interface{}, state map[string]interface{}) (interface{}, error) {
+	switch typed := value.(type) {
+	case string:
+		return resolveStringWithState(typed, state)
+	case map[string]interface{}:
+		resolved := make(map[string]interface{}, len(typed))
+		for key, inner := range typed {
+			out, err := resolveValueWithState(inner, state)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", key, err)
+			}
+			resolved[key] = out
+		}
+		return resolved, nil
+	case []interface{}:
+		resolved := make([]interface{}, len(typed))
+		for idx, inner := range typed {
+			out, err := resolveValueWithState(inner, state)
+			if err != nil {
+				return nil, fmt.Errorf("[%d]: %w", idx, err)
+			}
+			resolved[idx] = out
+		}
+		return resolved, nil
+	default:
+		return value, nil
+	}
+}
+
+func resolveStringWithState(input string, state map[string]interface{}) (string, error) {
+	matches := statePlaceholderPattern.FindAllStringSubmatch(input, -1)
+	if len(matches) == 0 {
+		return input, nil
+	}
+
+	resolved := input
+	for _, match := range matches {
+		if len(match) < 2 {
+			continue
+		}
+		path := match[1]
+		val, ok := lookupStatePath(state, path)
+		if !ok {
+			return "", fmt.Errorf("missing state value for path %q", path)
+		}
+		resolved = strings.ReplaceAll(resolved, match[0], fmt.Sprint(val))
+	}
+
+	return resolved, nil
+}
+
+func lookupStatePath(state map[string]interface{}, path string) (interface{}, bool) {
+	if state == nil || strings.TrimSpace(path) == "" {
+		return nil, false
+	}
+
+	segments := strings.Split(path, ".")
+	var current interface{} = state
+	for _, segment := range segments {
+		asMap, ok := current.(map[string]interface{})
+		if !ok {
+			return nil, false
+		}
+		next, exists := asMap[segment]
+		if !exists {
+			return nil, false
+		}
+		current = next
+	}
+
+	return current, true
 }
 
 func decodeToolResultToMap(res *mcp.CallToolResult) (map[string]interface{}, error) {
