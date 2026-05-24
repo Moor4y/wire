@@ -1,0 +1,12 @@
+# Binaries
+bin/
+orchestrator
+
+# Testing and local state
+*.db
+*.db-wal
+*.db-shm
+
+# IDEs
+.idea/
+.vscode/
